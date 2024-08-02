@@ -4,26 +4,6 @@
 # - https://github.com/drduh/YubiKey-Guide/blob/master/README.md
 # - https://musigma.blog/2021/05/09/gpg-ssh-ed25519.html
 
-
-if [ -d "$GNUPGHOME" ] && [ "$SEND_IT_IDC" != 1 ]; then
-	echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
-	echo "!                                   !"
-	echo "!   DANGER, WILL ROBINSON, DANGER   !"
-	echo "!                                   !"
-	echo "!   DO NOT USE THIS TOOL IN YOUR    !"
-	echo "!        USUAL ENVIRONMENT          !"
-	echo "!                                   !"
-	echo "!     IT MAY DELETE OR CORRUPT      !"
-	echo "!        EXISTING GPG KEYS          !"
-	echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
-	echo
-	echo "Either move your '$GNUPGHOME' somewhere safe"
-	echo "(not pointed to by the environment variable)"
-	echo " Or rerun the script with '$SEND_IT_IDC=1'"
-
-	exit 1
-fi
-
 wipe_tmpfiles() {
 	rm -rf "${TMPDIR:-/tmp}/ykprovision"*
 }
@@ -31,29 +11,37 @@ wipe_tmpfiles
 
 mktempdir() {
 	while true; do
-		local new_dir="$(mktemp --tmpdir --directory ykprovision.XXXXXXXXXXXXXXXXXXXXXXXXX)"
+		local new_dir="$(mktemp --tmpdir --directory ykprovision.XXXXXXXXXXXXXXXXXXXX)"
 
 		[ -d "$new_dir" ] || (echo "Error in creating $new_dir"; exit 1)
 		if [ "$new_dir" != "$GNUPGHOME" ]; then break; fi
 	done
-	echo -n "$new_dir"
+	echo "$new_dir"
 }
 
 # set params
 script_dir=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
-mine_matchfile='/tmp/ykprovision-matched'
-identity='Kristopher James Kent (kjkent) <kris@kjkent.dev>'
+identity="$@"
 key_type='ed25519'
 key_type_enc='cv25519'
 key_exp='2y'
 yk_pin_retries=3
-mine_generations=0
 
 # # Install necessary software
-sudo apt update && sudo apt -y upgrade && sudo apt -y install \
-  wget gnupg2 gnupg-agent dirmngr \
-  cryptsetup scdaemon pcscd \
-  yubikey-personalization yubikey-manager
+if [ -x /usr/bin/apt ]; then
+	sudo apt update &&
+	sudo apt -y upgrade && 
+	sudo apt -y install \
+		wget \
+		gnupg2 \
+		gnupg-agent \
+		dirmngr \
+		cryptsetup \
+		scdaemon \
+		pcscd \
+		yubikey-personalization \
+		yubikey-manager
+fi
 
 # Download hardened config if not already present on disk & copy to dir
 if [ ! -f "$script_dir/gpg.conf" ]; then
@@ -83,8 +71,6 @@ give_cert_pass() {
 	echo "COPY DOWN YOUR CERTIFICATION KEY PASSWORD!!!"
 }
 
-give_cert_pass "$cert_pass"
-
 make_key() {
 	local gnupghome="${1:-$GNUPGHOME}"
 
@@ -100,66 +86,11 @@ make_key() {
 		never
 }
 
-check_key() {
-	local gnupghome="$1"
-	local pattern="$2"
-
-	GNUPGHOME="$gnupghome" gpg --list-keys --with-colons |
-		awk -F: '/^fpr:/ { print $10; exit }' |
-			grep -Eiq "$pattern"
-}
-
-mine_key() {
-	# shellcheck disable=SC2016
-	local pattern="${MINE_KEY:?'mine_key() called without $MINE_KEY set'}"
-	# shellcheck disable=SC2155
-	local max_jobs="$(nproc)"
-	local jobs=0
-
-	trap 'wipe_tmpfiles;
-				echo; 
-				echo Giving up after $mine_generations generations! Exiting...;
-				exit' TERM INT
-	trap "echo; echo im goin im goin" EXIT
-
-	while true; do
-		# Start new jobs if we're below the limit
-		while (( jobs < "$max_jobs" )); do
-
-			(
-				tmp_gnupghome="$(mktempdir)"
-				make_key "$tmp_gnupghome"
-				if check_key "$tmp_gnupghome" "$pattern"; then
-					echo -n "$tmp_gnupghome" > "$mine_matchfile"
-				else
-					rm -rf "$tmp_gnupghome"
-				fi
-			) &
-			((jobs++))
-			((mine_generations++))
-
-			if [ -f "$mine_matchfile" ]; then
-				break 2
-			fi
-		done
-
-		wait -n
-		((jobs--))
-	done
-}
-
 while true; do
 	# Generate certification key with no expiration (stored on YK permanently)
-	if [ -n "$MINE_KEY" ]; then
-		mine_key
-		export GNUPGHOME="$(cat "$mine_matchfile")"
-		sleep 5 && clear
-		echo "Found a match in $mine_generations generations!"
-	else
-		export GNUPGHOME="$(mktempdir)"
-		make_key
-	fi
-
+	export GNUPGHOME="$(mktempdir)"
+	make_key
+	
 	# Export key ids for later user
 	export key_id=$(gpg -k --with-colons "$identity" | awk -F: '/^pub:/ { print $5; exit }')
 	export key_fp=$(gpg -k --with-colons "$identity" | awk -F: '/^fpr:/ { print $10; exit }')
@@ -181,14 +112,14 @@ for subkey in sign encrypt auth; do
 		subkey_type="$key_type"
 	fi
 
-	gpg \
-		--batch \
-		--pinentry-mode=loopback \
-		--passphrase "$cert_pass" \
-		--quick-add-key "$key_fp" \
-		"$subkey_type" \
-		"$subkey" \
-		"$key_exp"
+	gpg --batch \
+	    --quiet \
+	    --pinentry-mode=loopback \
+	    --passphrase "$cert_pass" \
+	    --quick-add-key "$key_fp" \
+	    "$subkey_type" \
+	    "$subkey" \
+	    "$key_exp"
 done
 
 # Export backup of all keys
@@ -210,9 +141,10 @@ gpg --output "$pubkey" \
 # encrypt privkeys and place keys in script dir
 for privkey in "$privkey_cert" "$privkey_subs"; do
 	gpg --output "$privkey.gpg" \
-		--pinentry-mode=loopback \
-		-r "$identity" \
-		--encrypt "$privkey"
+	    --pinentry-mode=loopback \
+	    -r "$identity" \
+	    --encrypt "$privkey"
+	
 	rm -f "$privkey"
 	mv "$privkey.gpg" "$script_dir/"
 done
@@ -326,5 +258,4 @@ done
 give_cert_pass "$cert_pass"
 
 echo "Backups saved to $script_dir, save them somewhere!"
-
 echo "BYE"
